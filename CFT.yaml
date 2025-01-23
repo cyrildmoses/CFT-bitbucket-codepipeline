@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Generic Terraform deployment pipeline.
+
+Parameters:
+  PipelineName:
+    Type: String
+    Description: The name of this pipeline. Should adhere to unified naming convention.
+
+  Stage:
+    Type: String
+    Description: The environment which this pipeline services.
+    Default: prod
+
+  OwnerEmail:
+    Type: String
+    Description: An email address that alerts pertaining to the pipeline should be sent to. Should ideally be a distribution list.
+
+  BuildImage:
+    Type: String
+    Description: Name of the docker image to use for terraform execution.
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+
+  TerraformReleaseZipURL:
+    Type: String
+    Description: URL of Terraform distribution zip file that will be used in the CodeBuild pipelines.
+    Default: https://releases.hashicorp.com/terraform/1.9.3/terraform_1.9.3_linux_amd64.zip
+
+  TerraformPermissionsPolicy:
+    Type: String
+    Description: Provide the ARN of an IAM Policy to attach to the CodeBuild role. This should provide all permissions required to plan and apply the Terraform stack. If this parameter is not provided, you should update the TerraformDeployPermissions resource in this template to allocate the correct permissions.
+    Default: NONE
+
+  BitbucketRepoId:
+    Type: String
+    Description: Id of the Infra management repository. Example OrgName/RepoName.
+
+  BitbucketBranchName:
+    Type: String
+    Description: Branch name of the Infra management repository.
+    Default: main
+
+Conditions:
+  ShouldAttachPolicy: !Not [!Equals [!Ref TerraformPermissionsPolicy, "NONE"]]
+
+Resources:
+  # Put all permissions that the Terraform module will need to manage its owned resources in this policy.
+  TerraformDeployPermissions:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${PipelineName}-tfpolicy-${AWS::Region}-${Stage}
+      Description: "Provides permissions for the CodeBuild deployment of Terraform modules."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TagAccess
+            Resource: "*"
+            Effect: "Allow"
+            Action:
+              - "tags:GetTagKeys"
+              - "tags:GetTagValues"
+              - "tags:TagResources"
+              - "tags:UntagResources"
+  ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ###
+  ## No need to touch anything below this line. ##
+  ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ###
+  SnsKmsKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: "KMS key for encryption purposes"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !GetAtt CodePipelineRole.Arn
+            Action: "kms:*"
+            Resource: "*"
+
+  SnsKmsKeyAlias:
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: !Sub "alias/${PipelineName}-${Stage}"
+      TargetKeyId: !Ref SnsKmsKey
+
+  NotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${PipelineName}-${Stage}
+      KmsMasterKeyId: !Ref SnsKmsKey
+      Subscription:
+        - Endpoint: !Ref OwnerEmail
+          Protocol: email
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # checkov:skip=CKV_AWS_18:logging is not required for this bucket
+      BucketName: !Sub ${PipelineName}-artifacts-${Stage}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BitbucketConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: bitbucket-connection
+      ProviderType: Bitbucket
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${PipelineName}-pipeline-role-${AWS::Region}-${Stage}
+      # checkov:skip=CKV_AWS_111:Need to find the resoruces which needs write access to it
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Policies:
+        - PolicyName: PrimaryAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LogsAccess
+                Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Sid: CodestarConnectionsAccess
+                Resource: !Ref BitbucketConnection
+                Effect: Allow
+                Action:
+                  - codeconnections:GitPull
+                  - codeconnections:GetBranch
+                  - codeconnections:GetCommit
+                  - codeconnections:ListBranches
+                  - codeconnections:UploadArchive
+                  - codepipeline:PutApprovalResult
+                  - codepipeline:PollForJobs
+                  - codeconnections:GetUploadArchiveStatus
+                  - codestar-connections:UseConnection
+              - Sid: CodeBuildAccess
+                Resource:
+                  - !GetAtt TerraformPlanProject.Arn
+                  - !GetAtt TerraformApplyProject.Arn
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+              - Sid: SNSAccess
+                Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${PipelineName}-NotificationSNSTopic*"
+                Effect: Allow
+                Action:
+                  - sns:Publish
+              - Sid: ArtifactBucketAccess
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:Get*
+              - Sid: ArtifactBucketObjectAccess
+                Resource:
+                  - !Sub
+                    - ${ArtifactBucketArn}/*
+                    - ArtifactBucketArn: !GetAtt ArtifactBucket.Arn
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${PipelineName}-build-role-${AWS::Region}-${Stage}
+      # checkov:skip=CKV_AWS_111:Need to find the resoruces which needs write access to it
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      ManagedPolicyArns: !If
+        - ShouldAttachPolicy
+        - [!Ref TerraformDeployPermissions, !Ref TerraformPermissionsPolicy]
+        - [!Ref TerraformDeployPermissions]
+
+      Policies:
+        - PolicyName: PrimaryAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LogsAccess
+                Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Sid: StateBucketAccess
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:Get*
+              - Sid: ArtifactBucketObjectAccess
+                Resource:
+                  - !Sub
+                    - ${ArtifactBucketArn}/*
+                    - ArtifactBucketArn: !GetAtt ArtifactBucket.Arn
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Sid: KMSAccessForSSHKey
+                Resource: 
+                  - !Sub 'arn:aws:kms:us-east-1:715841349622:key/*'
+                Effect: Allow 
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Condition:
+                  ForAnyValue:StringLike: 
+                    kms:ResourceAliases: 'alias/infra-lz-shared-secrets-encryption-key'
+
+  TerraformPlanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${PipelineName}-tfplan-${Stage}
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-tf-plan.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImage
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  TerraformApplyProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${PipelineName}-tfapply-${Stage}
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-tf-apply.yaml
+      Environment:
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Type: LINUX_CONTAINER
+        Image: !Ref BuildImage
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Name: !Sub ${PipelineName}-${Stage}
+      ArtifactStores:
+        - Region: !Ref AWS::Region
+          ArtifactStore:
+            Type: S3
+            Location: !Ref ArtifactBucket
+      Stages:
+        - Name: FetchSource
+          Actions:
+            - Name: BitbucketSource
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Provider: CodeStarSourceConnection
+                Owner: AWS
+                Version: 1
+              Namespace: BitbucketSource
+              OutputArtifacts:
+                - Name: BitbucketCode
+              Configuration:
+                BranchName: !Ref BitbucketBranchName
+                ConnectionArn: !Ref BitbucketConnection
+                FullRepositoryId: !Ref BitbucketRepoId
+                DetectChanges: false
+                OutputArtifactFormat: CODE_ZIP
+            
+        - Name: TerraformPlan
+          Actions:
+            - Name: TerraformPlan
+              RunOrder: 1
+              Namespace: TfPlan
+              InputArtifacts:
+                - Name: BitbucketCode
+              OutputArtifacts:
+                - Name: TerraformPlan
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref TerraformPlanProject
+                PrimarySource: BitbucketCode
+                EnvironmentVariables: !Sub |
+                  [ 
+                      {"name": "BUCKET",          "value": "${ArtifactBucket}"},
+                      {"name": "STAGE",           "value": "${Stage}"},
+                      {"name": "REGION",          "value": "${AWS::Region}"},
+                      {"name": "TF_ZIP_URL",      "value": "${TerraformReleaseZipURL}"}
+                  ]
+        - Name: ReviewPlan
+          Actions:
+            - Name: ReviewPlan
+              RunOrder: 1
+              TimeoutInMinutes: 60
+              ActionTypeId:
+                Category: Approval
+                Provider: Manual
+                Owner: AWS
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref NotificationSNSTopic
+                CustomData: !Sub "Review Terraform Plan for ${PipelineName}-${Stage}"
+                ExternalEntityLink: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/${AWS::AccountId}/projects/#{TfPlan.BuildID}/build/#{TfPlan.BuildID}%3A#{TfPlan.BuildTag}/?region=${AWS::Region}"
+        - Name: TerraformApply
+          Actions:
+            - Name: TerraformApply
+              RunOrder: 1
+              Namespace: TfApply
+              InputArtifacts:
+                - Name: TerraformPlan
+                - Name: BitbucketCode
+                - Name: UtilityBitbucketCode
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: "1"
+              Configuration:
+                PrimarySource: BitbucketCode
+                ProjectName: !Ref TerraformApplyProject
+                PrimarySource: BitbucketCode
+                EnvironmentVariables: !Sub |
+                  [ 
+                      {"name": "BUCKET",          "value": "${ArtifactBucket}"},
+                      {"name": "STAGE",           "value": "${Stage}"},
+                      {"name": "REGION",          "value": "${AWS::Region}"},
+                      {"name": "TF_ZIP_URL",      "value": "${TerraformReleaseZipURL}"}
+                  ]
