@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+    install:
+        commands:
+            - "mkdir -p ssh-scripts && cp ../01/ssh-scripts/* ./ssh-scripts/."
+            - "chmod -R 755 ./ssh-scripts"
+            - "./ssh-scripts/github-ssh-secrets.sh"
+            - "curl -s $TF_ZIP_URL -o terraform.zip"
+            - "unzip terraform.zip -d /usr/local/bin"
+            - "chmod 755 /usr/local/bin/terraform"
+            - "cp -aln $CODEBUILD_SRC_DIR_TerraformPlan/. ./"
+    pre_build:
+        commands:
+            - "terraform init --backend-config=\"bucket=$BUCKET\" --backend-config=\"key=$STAGE.tfstate\" --backend-config=\"region=$REGION\""
+    build:
+        commands:
+            - "terraform apply $STAGE-terraform.tfplan"

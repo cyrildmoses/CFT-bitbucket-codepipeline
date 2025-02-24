@@ -1,0 +1,45 @@
+version: 0.2
+
+env:
+    exported-variables:
+        - BuildID
+        - BuildTag
+
+phases:
+    install:
+        commands:
+            - "mkdir -p terraform-generator && cp ../01/terraform-generator/* ./terraform-generator/."
+            - "mkdir -p ssh-scripts && cp ../01/ssh-scripts/* ./ssh-scripts/."
+            - "pip install -r ./terraform-generator/requirements.txt"
+            - "chmod -R 755 ./ssh-scripts"
+            - "./ssh-scripts/github-ssh-secrets.sh"
+            - "curl -s $TF_ZIP_URL -o terraform.zip"
+            - "unzip terraform.zip -d /usr/local/bin"
+            - "chmod 755 /usr/local/bin/terraform"
+    pre_build:
+        commands:
+            - |
+              if [ -d "jinja-templates" ] && [ -d "terraform-generator" ]; then
+                echo "Running Python script to generate terraform...";
+                python ./terraform-generator/generate-terraform-files.py $STAGE;
+                if [ $? -ne 0 ]; then
+                    echo "Python script generate-terraform-files failed, stopping pipeline"
+                    exit 1
+                else
+                    echo "generate-terraform-files.py script executed successfully"
+                 fi
+              else
+                echo "jinja-templates or  terraform-generator folder is not found. Skipping generate-terraform-files.py script execution.";
+              fi
+            - "terraform init --backend-config=\"bucket=$BUCKET\" --backend-config=\"key=$STAGE.tfstate\" --backend-config=\"region=$REGION\""
+    build:
+        commands:
+            - "terraform plan -var=\"stage=$STAGE\" -var=\"region=$REGION\" -out=$STAGE-terraform.tfplan"
+            - "export BuildID=`echo $CODEBUILD_BUILD_ID | cut -d: -f1`"
+            - "export BuildTag=`echo $CODEBUILD_BUILD_ID | cut -d: -f2`"
+
+artifacts:
+    name: TerraformPlan
+    files:
+        - $STAGE-terraform.tfplan
+        - ./**/*.tf
